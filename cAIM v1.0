@@ -1,0 +1,852 @@
+-- ============================================================
+--   cAIM v1.0  |  WindUI Edition
+--   Advanced Aimlock & Combat Hub
+--
+--   Changes vs v3.2:
+--     NEW  • Home tab added as the first tab — gives the user a full
+--            feature overview and quick-reference keybind list on load
+-- ============================================================
+
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local Players        = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui          = game:GetService("CoreGui")
+local LocalPlayer      = Players.LocalPlayer
+local Camera           = workspace.CurrentCamera
+
+-- ============================================================
+--   FAST LOCALS
+-- ============================================================
+local mathFloor  = math.floor
+local mathClamp  = math.clamp
+local mathAbs    = math.abs
+local mathMax    = math.max
+local mathRandom = math.random
+local Vector2New = Vector2.new
+local Vector3New = Vector3.new
+local Color3RGB  = Color3.fromRGB
+local CFrameNew  = CFrame.new
+
+-- ============================================================
+--   SETTINGS
+-- ============================================================
+local Settings = {
+    Aimlock = {
+        Enabled            = false,
+        Prediction         = 0.135,
+        PredictionEnabled  = true,
+        AimMode            = "Smart",   -- Smart / Head / Torso / Limbs / HRP / Chaos
+        IsAiming           = false,
+        CurrentTarget      = nil,
+        WallCheck          = true,
+        TeamCheck          = true,
+        SmoothAiming       = false,
+        SmoothSpeed        = 0.3,
+        StrafePrediction   = 1.0,
+        PeriodicDisable    = false,
+        Keybind            = "RightClick",
+    },
+    FOV = {
+        Visible        = true,
+        FollowCursor   = true,
+        Radius         = 150,
+        Thickness      = 1.5,
+        Color          = Color3RGB(255, 255, 255),
+        Transparency   = 0.8,
+        Filled         = false,
+        FilledColor    = Color3RGB(255, 255, 255),
+        FilledTransp   = 0.92,
+    },
+    Visuals = {
+        ESPEnabled         = false,
+        ESPBoxes           = true,
+        ESPNames           = true,
+        ESPNameStyle       = "Display Name",
+        ESPOutline         = true,
+        ESPTextScale       = 14,
+        UseCustomNameColor = false,
+        ESPNameColor       = Color3RGB(255, 255, 255),
+        ESPUsernameColor   = Color3RGB(180, 180, 200),
+        TeamCheck          = true,
+        ShowTeammates      = false,
+        TeammateColor      = Color3RGB(0, 200, 255),
+        UseVisColors       = true,
+        VisColor           = Color3RGB(50, 255, 80),
+        HiddenColor        = Color3RGB(255, 60, 60),
+        DistanceDisplay    = false,
+        HealthNumbers      = false,
+        HealthBar          = true,
+        ChamsEnabled       = false,
+        ChamsFillColor     = Color3RGB(255, 30, 30),
+        ChamsOutlineColor  = Color3RGB(255, 255, 255),
+        ChamsDepth         = true,
+        TracerLines        = false,
+        TracerOrigin       = "Bottom",
+        TracerColor        = Color3RGB(0, 200, 255),
+        SnapLines          = false,
+        SnapLineColor      = Color3RGB(255, 0, 220),
+        TargetUI           = true,
+        HealthPosition     = "TopRight",
+        MaxESPDistance     = 1000,
+    },
+    Player = {
+        WalkSpeedEnabled = false,
+        WalkSpeed        = 16,
+        JumpPowerEnabled = false,
+        JumpPower        = 50,
+        NoclipEnabled    = false,
+        NoclipKeybind    = "N",
+    },
+    DetectionAvoidance = {
+        RandomJitter       = false,
+        JitterAmount       = 0.05,
+        PeriodicAimDisable = false,
+        DisableChance      = 0.1,
+        DisableDuration    = 0.2,
+    },
+    UI = {
+        ToggleKey = "K",
+    },
+}
+
+-- ============================================================
+--   CHAOS AIM MODE STATE
+--   Rotates through body parts every CHAOS_INTERVAL seconds,
+--   never picking the same part twice in a row.
+-- ============================================================
+local CHAOS_INTERVAL  = 0.3   -- seconds between part switches
+local CHAOS_PARTS     = {
+    "Head",
+    "UpperTorso",       -- R15 torso; fallback to "Torso" (R6) handled in GetAimPart
+    "Torso",            -- included so R6 characters also get torso hits
+    "LeftUpperArm",
+    "RightUpperArm",
+    "LeftUpperLeg",
+    "RightUpperLeg",
+}
+-- Deduplicated list used for selection (Torso + UpperTorso are both in the
+-- pool; whichever exists on the character will be chosen at runtime).
+local CHAOS_PICK_LIST = {
+    "Head",
+    "UpperTorso",
+    "LeftUpperArm",
+    "RightUpperArm",
+    "LeftUpperLeg",
+    "RightUpperLeg",
+}
+local chaosCurrentPart  = "Head"   -- currently active part name
+local chaosLastPart     = ""       -- tracks previous pick to avoid repeats
+local chaosTimer        = 0        -- countdown to next switch
+
+local function PickNextChaosPart()
+    local pool   = CHAOS_PICK_LIST
+    local count  = #pool
+    if count == 1 then return pool[1] end
+    -- Build a filtered list that excludes the last pick
+    local candidates = {}
+    for _, name in ipairs(pool) do
+        if name ~= chaosLastPart then
+            candidates[#candidates + 1] = name
+        end
+    end
+    local chosen  = candidates[mathRandom(#candidates)]
+    chaosLastPart = chosen
+    return chosen
+end
+
+-- ============================================================
+--   DRAWING OBJECTS
+-- ============================================================
+local FOVRing        = Drawing.new("Circle")
+FOVRing.Visible      = false
+FOVRing.Thickness    = 1.5
+FOVRing.Transparency = Settings.FOV.Transparency
+FOVRing.Color        = Settings.FOV.Color
+FOVRing.Filled       = false
+
+local FOVFill        = Drawing.new("Circle")
+FOVFill.Visible      = false
+FOVFill.Thickness    = 1
+FOVFill.Transparency = Settings.FOV.FilledTransp
+FOVFill.Color        = Settings.FOV.FilledColor
+FOVFill.Filled       = true
+
+local ChamsFolder  = Instance.new("Folder")
+ChamsFolder.Name   = "cAIMChams"
+ChamsFolder.Parent = CoreGui
+
+local TracerLineCache = {}
+
+-- ============================================================
+--   TARGET HUD
+-- ============================================================
+local TargetGui = Instance.new("ScreenGui")
+TargetGui.Name           = "cAIMTargetHUD"
+TargetGui.ResetOnSpawn   = false
+TargetGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+TargetGui.Parent         = CoreGui
+
+local TargetFrame = Instance.new("Frame", TargetGui)
+TargetFrame.Size                   = UDim2.new(0, 280, 0, 80)
+TargetFrame.Position               = UDim2.new(0.5, -140, 0.65, 0)
+TargetFrame.BackgroundColor3       = Color3RGB(14, 14, 20)
+TargetFrame.BackgroundTransparency = 0.1
+TargetFrame.Visible                = false
+TargetFrame.BorderSizePixel        = 0
+Instance.new("UICorner", TargetFrame).CornerRadius = UDim.new(0, 10)
+local TStroke        = Instance.new("UIStroke", TargetFrame)
+TStroke.Color        = Color3RGB(80, 180, 255)
+TStroke.Thickness    = 1.5
+TStroke.Transparency = 0.3
+
+local NameLabel                  = Instance.new("TextLabel", TargetFrame)
+NameLabel.Size                   = UDim2.new(1, -16, 0, 28)
+NameLabel.Position               = UDim2.new(0, 8, 0, 8)
+NameLabel.BackgroundTransparency = 1
+NameLabel.TextColor3             = Color3RGB(240, 240, 255)
+NameLabel.TextXAlignment         = Enum.TextXAlignment.Left
+NameLabel.Font                   = Enum.Font.GothamBold
+NameLabel.TextSize               = 16
+NameLabel.Text                   = "Target"
+
+local DistLabel                  = Instance.new("TextLabel", TargetFrame)
+DistLabel.Size                   = UDim2.new(1, -16, 0, 20)
+DistLabel.Position               = UDim2.new(0, 8, 0, 36)
+DistLabel.BackgroundTransparency = 1
+DistLabel.TextColor3             = Color3RGB(130, 130, 160)
+DistLabel.TextXAlignment         = Enum.TextXAlignment.Left
+DistLabel.Font                   = Enum.Font.Gotham
+DistLabel.TextSize               = 13
+DistLabel.Text                   = "Distance: 0m"
+
+local HPLabel                    = Instance.new("TextLabel", TargetFrame)
+HPLabel.Size                     = UDim2.new(0, 60, 0, 24)
+HPLabel.Position                 = UDim2.new(1, -68, 0, 8)
+HPLabel.BackgroundColor3         = Color3RGB(10, 10, 16)
+HPLabel.BackgroundTransparency   = 0.1
+HPLabel.TextColor3               = Color3RGB(0, 255, 120)
+HPLabel.TextXAlignment           = Enum.TextXAlignment.Center
+HPLabel.Font                     = Enum.Font.GothamBlack
+HPLabel.TextSize                 = 15
+HPLabel.Text                     = "100"
+HPLabel.Visible                  = false
+Instance.new("UICorner", HPLabel).CornerRadius = UDim.new(0, 6)
+local HPStroke        = Instance.new("UIStroke", HPLabel)
+HPStroke.Color        = Color3RGB(0, 255, 120)
+HPStroke.Thickness    = 1.5
+HPStroke.Transparency = 0.3
+
+-- Chaos mode indicator label — shows which part is currently targeted
+local ChaosLabel                  = Instance.new("TextLabel", TargetFrame)
+ChaosLabel.Size                   = UDim2.new(1, -16, 0, 16)
+ChaosLabel.Position               = UDim2.new(0, 8, 0, 58)
+ChaosLabel.BackgroundTransparency = 1
+ChaosLabel.TextColor3             = Color3RGB(255, 160, 40)
+ChaosLabel.TextXAlignment         = Enum.TextXAlignment.Left
+ChaosLabel.Font                   = Enum.Font.Gotham
+ChaosLabel.TextSize               = 11
+ChaosLabel.Text                   = ""
+ChaosLabel.Visible                = false
+
+local HUDLastHP   = -1
+local HUDLastDist = -1
+
+-- ============================================================
+--   WINDOW
+-- ============================================================
+local Window = WindUI:CreateWindow({
+    Title     = "cAIM v1.0",
+    Author    = "by somai",
+    Folder    = "cAIM",
+    Size      = UDim2.fromOffset(610, 560),
+    Theme     = "Dark",
+    Resizable = true,
+})
+
+Window:Tag({
+    Title  = "v" .. WindUI.Version,
+    Icon   = "github",
+    Color  = Color3.fromHex("#1c1c1c"),
+    Border = true,
+})
+
+Window:SetToggleKey(Enum.KeyCode.K)
+
+-- ============================================================
+--   TABS
+-- ============================================================
+local HomeTab     = Window:Tab({ Title = "Home",     Icon = "home"      })
+local AimlockTab  = Window:Tab({ Title = "Aimlock",  Icon = "crosshair" })
+local ESPTab      = Window:Tab({ Title = "ESP",      Icon = "eye"       })
+local PlayerTab   = Window:Tab({ Title = "Player",   Icon = "user"      })
+local VisualsTab  = Window:Tab({ Title = "Visuals",  Icon = "palette"   })
+local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings"  })
+
+-- ============================================================
+--   HOME TAB  —  feature overview & quick reference
+-- ============================================================
+local HomeWelcome = HomeTab:Section({ Title = "Welcome to cAIM v1.0", Opened = true })
+
+HomeWelcome:Paragraph({
+    Title = "What is cAIM?",
+    Desc  = "cAIM is a lightweight, performance-focused combat utility built on WindUI. Every feature is designed to be highly configurable — nothing is hardcoded. You can tune every setting to match your playstyle and the game you're in.",
+    Color = "Blue",
+})
+
+HomeWelcome:Paragraph({
+    Title = "Getting Started",
+    Desc  = "Press K to open and close this menu at any time. Hold Right Click (or your custom keybind) to activate aimlock while the menu is closed. All settings save via the Config system in the Settings tab.",
+    Color = "Green",
+})
+
+-- ============================================================
+local HomeAimlock = HomeTab:Section({ Title = "Aimlock", Opened = true })
+
+HomeAimlock:Paragraph({
+    Title = "Core Aimlock",
+    Desc  = "Hold your aimlock key to lock the camera onto the nearest enemy within your FOV circle. Wall Check skips enemies behind geometry. Team Check prevents locking teammates. The lock releases the moment you let go of the key.",
+    Color = "Blue",
+})
+
+HomeAimlock:Paragraph({
+    Title = "Aim Modes",
+    Desc  = "Smart — Automatically picks the highest-priority visible body part (Head first, then Torso, then HRP). Keeps locking even if only the torso is peeking.\n\nChaos — Randomly cycles between Head, Torso, Arms, and Legs every 0.3 seconds, never hitting the same part twice in a row. Great for bypassing per-hitbox anticheat.\n\nHead / Torso / Limbs / HRP — Force a fixed body part regardless of visibility.",
+    Color = "Blue",
+})
+
+HomeAimlock:Paragraph({
+    Title = "Prediction",
+    Desc  = "When enabled, velocity-based prediction offsets the aim point ahead of the target so bullets land even on moving or strafing enemies. Adjust Prediction Strength (how far ahead) and Strafe Multiplier (how much side-movement is factored in) in the Aim Tuning section.",
+    Color = "Blue",
+})
+
+HomeAimlock:Paragraph({
+    Title = "Smooth Aiming",
+    Desc  = "Instead of snapping instantly, the camera lerps toward the target each frame. Lower Smooth Speed values feel floaty and human-like; values near 1.0 are nearly instant. Use this when you want the lock to look less mechanical.",
+    Color = "Blue",
+})
+
+HomeAimlock:Paragraph({
+    Title = "Detection Avoidance",
+    Desc  = "Random Jitter adds tiny positional noise to your aim to avoid perfect-lock detection patterns. Periodic Disable randomly pauses aimlock for short intervals so your aim history does not look robotic over time. Both are tunable in the Advanced section.",
+    Color = "Grey",
+})
+
+-- ============================================================
+local HomeESP = HomeTab:Section({ Title = "ESP", Opened = true })
+
+HomeESP:Paragraph({
+    Title = "2D Boxes & Names",
+    Desc  = "Draws a 2D bounding box around every enemy player scaled to their on-screen height. Display Name, Username, or Both can appear above the box. An optional dark outline adds contrast against bright backgrounds.",
+    Color = "Blue",
+})
+
+HomeESP:Paragraph({
+    Title = "Visibility Colors",
+    Desc  = "When enabled, boxes and names switch between two colors depending on whether you have line-of-sight to the target. Visible Color is shown when the enemy is exposed; Hidden Color when they are behind a wall. Both are fully customisable.",
+    Color = "Blue",
+})
+
+HomeESP:Paragraph({
+    Title = "Health Bar",
+    Desc  = "A vertical bar on the left side of each box shows the enemy's current health as a percentage. The bar color transitions from green (full HP) through yellow and orange to red (low HP) automatically.",
+    Color = "Blue",
+})
+
+HomeESP:Paragraph({
+    Title = "Chams",
+    Desc  = "Uses Roblox's native Highlight system to paint a colored fill and outline over enemy characters. See Through Walls mode shows chams even when enemies are fully behind geometry. Fill and outline colors are set independently.",
+    Color = "Blue",
+})
+
+HomeESP:Paragraph({
+    Title = "Tracer & Snap Lines",
+    Desc  = "Tracer Lines draw a line from a chosen screen edge (Bottom, Center, or Top) to each enemy. Snap Lines draw from the exact screen center. Both have independent color pickers and can be used together.",
+    Color = "Blue",
+})
+
+HomeESP:Paragraph({
+    Title = "ESP Range",
+    Desc  = "The ESP Range slider (100–5000 studs) culls any enemy beyond that distance before any drawing work is done, keeping performance high in large open-world maps.",
+    Color = "Grey",
+})
+
+-- ============================================================
+local HomePlayer = HomeTab:Section({ Title = "Player", Opened = true })
+
+HomePlayer:Paragraph({
+    Title = "Walk Speed & Jump Power",
+    Desc  = "Override your character's WalkSpeed and JumpPower to any value. Toggle each on or off independently — turning them off restores the game's default values immediately.",
+    Color = "Blue",
+})
+
+HomePlayer:Paragraph({
+    Title = "Noclip",
+    Desc  = "Disables collision on all your character parts so you can move through walls and floors. Original collision states are cached on enable and restored exactly on disable — no permanently broken hitboxes. Assign any keyboard key to toggle it without opening the menu.",
+    Color = "Blue",
+})
+
+-- ============================================================
+local HomeVisuals = HomeTab:Section({ Title = "Visuals", Opened = true })
+
+HomeVisuals:Paragraph({
+    Title = "FOV Circle",
+    Desc  = "A configurable circle that shows the aimlock detection radius. Follow Cursor mode moves it with your mouse so the circle always matches exactly where the aimlock will search. Screen Center mode locks it to the middle of the screen. Radius, thickness, color, and transparency are all adjustable.",
+    Color = "Blue",
+})
+
+HomeVisuals:Paragraph({
+    Title = "Filled FOV",
+    Desc  = "An optional semi-transparent fill inside the FOV ring. Fill color and transparency are set independently from the ring outline, so you can have a bright ring with a barely-visible interior tint.",
+    Color = "Blue",
+})
+
+HomeVisuals:Paragraph({
+    Title = "Target HUD",
+    Desc  = "A small card that appears at the bottom of your screen while you are locked onto a target. Shows the enemy's display name and distance in studs. Optionally shows exact HP as a badge. The card border turns orange when locking through a wall (Smart or Chaos mode only).",
+    Color = "Blue",
+})
+
+-- ============================================================
+local HomeSettings = HomeTab:Section({ Title = "Settings & Config", Opened = true })
+
+HomeSettings:Paragraph({
+    Title = "Config System",
+    Desc  = "Save Config writes every toggle, slider, dropdown, keybind, and color picker to a JSON file in your executor's workspace folder under cAIM/config/cAIM_config.json. Load Config restores all settings from that file. This persists between sessions.",
+    Color = "Blue",
+})
+
+HomeSettings:Paragraph({
+    Title = "Themes",
+    Desc  = "Switch between Dark, Light, and Rose WindUI themes instantly from the Settings tab. The theme change applies to all menus immediately with no restart needed.",
+    Color = "Blue",
+})
+
+-- ============================================================
+local HomeKeybinds = HomeTab:Section({ Title = "Keybind Reference", Opened = true })
+
+HomeKeybinds:Paragraph({
+    Title = "Default Keybinds",
+    Desc  = "K  —  Open / close the cAIM menu\nRight Click  —  Hold to activate aimlock\nN  —  Toggle noclip on / off\n\nAll three keybinds are fully rebindable inside the menu.",
+    Color = "Green",
+})
+
+HomeKeybinds:Paragraph({
+    Title = "Tips",
+    Desc  = "• Aimlock only activates while the key is held — releasing it immediately drops the lock and returns camera control to you.\n• In Chaos mode the Target HUD shows which body part is currently being targeted in real time (⚡ PartName).\n• The FOV circle is the true search boundary — if an enemy is outside it, they will never be locked.",
+    Color = "Grey",
+})
+
+-- ============================================================
+--   AIMLOCK TAB
+-- ============================================================
+local AimSection = AimlockTab:Section({ Title = "Aimlock Control", Opened = true })
+
+AimSection:Toggle({
+    Title    = "Enable Aimlock",
+    Desc     = "Master toggle for the aimlock system",
+    Flag     = "AimlockEnabled",
+    Value    = false,
+    Callback = function(v) Settings.Aimlock.Enabled = v end,
+})
+
+AimSection:Keybind({
+    Title    = "Aimlock Key",
+    Desc     = "Hold this key to lock onto the nearest target",
+    Flag     = "AimlockKeybind",
+    Value    = "RightClick",
+    Callback = function(v) Settings.Aimlock.Keybind = v end,
+})
+
+AimSection:Toggle({
+    Title    = "Wall Check",
+    Desc     = "Ignore targets that are behind walls",
+    Flag     = "AimlockWallCheck",
+    Value    = true,
+    Callback = function(v) Settings.Aimlock.WallCheck = v end,
+})
+
+AimSection:Toggle({
+    Title    = "Team Check",
+    Desc     = "Never lock onto players on your team",
+    Flag     = "AimlockTeamCheck",
+    Value    = true,
+    Callback = function(v) Settings.Aimlock.TeamCheck = v end,
+})
+
+local AimTuning = AimlockTab:Section({ Title = "Aim Tuning", Opened = true })
+
+AimTuning:Dropdown({
+    Title    = "Aim Mode",
+    Desc     = "Smart = highest visible part. Chaos = randomises every 0.3s. Others force a fixed part.",
+    Flag     = "AimlockAimMode",
+    Values   = { "Smart", "Chaos", "Head", "Torso", "Limbs", "HRP" },
+    Value    = "Smart",
+    Callback = function(v)
+        Settings.Aimlock.AimMode = v
+        -- Reset chaos state when switching to Chaos so it starts fresh
+        if v == "Chaos" then
+            chaosTimer       = 0
+            chaosLastPart    = ""
+            chaosCurrentPart = PickNextChaosPart()
+        end
+    end,
+})
+
+AimTuning:Toggle({
+    Title    = "Enable Prediction",
+    Desc     = "Apply velocity-based prediction to lead moving targets",
+    Flag     = "AimlockPredictionEnabled",
+    Value    = true,
+    Callback = function(v) Settings.Aimlock.PredictionEnabled = v end,
+})
+
+AimTuning:Slider({
+    Title    = "Prediction Strength",
+    Desc     = "How far ahead to lead moving targets (seconds)",
+    Flag     = "AimlockPrediction",
+    Step     = 0.005,
+    Value    = { Min = 0, Max = 0.3, Default = 0.135 },
+    Callback = function(v) Settings.Aimlock.Prediction = v end,
+})
+
+AimTuning:Slider({
+    Title    = "Strafe Multiplier",
+    Desc     = "Velocity scale for strafing targets",
+    Flag     = "AimlockStrafePrediction",
+    Step     = 0.05,
+    Value    = { Min = 0.5, Max = 2.5, Default = 1.0 },
+    Callback = function(v) Settings.Aimlock.StrafePrediction = v end,
+})
+
+local AdvAim = AimlockTab:Section({ Title = "Advanced", Opened = false })
+
+AdvAim:Toggle({
+    Title    = "Smooth Aiming",
+    Desc     = "Gradually lerp the camera to the target",
+    Flag     = "AimlockSmooth",
+    Value    = false,
+    Callback = function(v) Settings.Aimlock.SmoothAiming = v end,
+})
+
+AdvAim:Slider({
+    Title    = "Smooth Speed",
+    Desc     = "Lerp factor — higher feels snappier",
+    Flag     = "AimlockSmoothSpeed",
+    Step     = 0.05,
+    Value    = { Min = 0.05, Max = 1.0, Default = 0.3 },
+    Callback = function(v) Settings.Aimlock.SmoothSpeed = v end,
+})
+
+AdvAim:Toggle({
+    Title    = "Random Jitter",
+    Desc     = "Add subtle noise to aim to look more human",
+    Flag     = "AimlockJitter",
+    Value    = false,
+    Callback = function(v) Settings.DetectionAvoidance.RandomJitter = v end,
+})
+
+AdvAim:Slider({
+    Title    = "Jitter Amount",
+    Desc     = "Strength of random aim displacement",
+    Flag     = "AimlockJitterAmount",
+    Step     = 0.005,
+    Value    = { Min = 0, Max = 0.2, Default = 0.05 },
+    Callback = function(v) Settings.DetectionAvoidance.JitterAmount = v end,
+})
+
+AdvAim:Toggle({
+    Title    = "Periodic Disable",
+    Desc     = "Randomly pause aimlock to avoid detection",
+    Flag     = "AimlockPeriodicDisable",
+    Value    = false,
+    Callback = function(v) Settings.DetectionAvoidance.PeriodicAimDisable = v end,
+})
+
+AdvAim:Slider({
+    Title    = "Disable Chance",
+    Desc     = "Probability per cycle that aimlock pauses",
+    Flag     = "AimlockDisableChance",
+    Step     = 0.01,
+    Value    = { Min = 0, Max = 1.0, Default = 0.1 },
+    Callback = function(v) Settings.DetectionAvoidance.DisableChance = v end,
+})
+
+-- ============================================================
+--   ESP TAB
+-- ============================================================
+local ESPCore = ESPTab:Section({ Title = "ESP Core", Opened = true })
+
+ESPCore:Toggle({
+    Title    = "Enable ESP",
+    Desc     = "Show player boxes, names, and health",
+    Flag     = "ESPEnabled",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.ESPEnabled = v end,
+})
+
+ESPCore:Toggle({
+    Title    = "Team Check",
+    Desc     = "Do not show ESP on players in your team",
+    Flag     = "ESPTeamCheck",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.TeamCheck = v end,
+})
+
+ESPCore:Toggle({
+    Title    = "Show Teammates",
+    Desc     = "Highlight your teammates with a separate color",
+    Flag     = "ESPShowTeammates",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.ShowTeammates = v end,
+})
+
+ESPCore:Colorpicker({
+    Title    = "Teammate Color",
+    Desc     = "Color used for teammate ESP overlays",
+    Flag     = "ESPTeammateColor",
+    Default  = Color3RGB(0, 200, 255),
+    Callback = function(v) Settings.Visuals.TeammateColor = v end,
+})
+
+local BoxSection = ESPTab:Section({ Title = "Box", Opened = true })
+
+BoxSection:Toggle({
+    Title    = "ESP Boxes",
+    Desc     = "Draw a bounding box around each player",
+    Flag     = "ESPBoxes",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.ESPBoxes = v end,
+})
+
+BoxSection:Toggle({
+    Title    = "Box Outline",
+    Desc     = "Add a dark outline behind the box for contrast",
+    Flag     = "ESPOutline",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.ESPOutline = v end,
+})
+
+local ColorSection = ESPTab:Section({ Title = "Colors", Opened = true })
+
+ColorSection:Toggle({
+    Title    = "Visibility Colors",
+    Desc     = "Use different colors for visible vs hidden targets",
+    Flag     = "ESPVisColors",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.UseVisColors = v end,
+})
+
+ColorSection:Colorpicker({
+    Title    = "Visible Color",
+    Desc     = "ESP color when you have line-of-sight on the target",
+    Flag     = "ESPVisColor",
+    Default  = Color3RGB(50, 255, 80),
+    Callback = function(v) Settings.Visuals.VisColor = v end,
+})
+
+ColorSection:Colorpicker({
+    Title    = "Hidden Color",
+    Desc     = "ESP color when target is behind a wall",
+    Flag     = "ESPHiddenColor",
+    Default  = Color3RGB(255, 60, 60),
+    Callback = function(v) Settings.Visuals.HiddenColor = v end,
+})
+
+local TextSection = ESPTab:Section({ Title = "Text & Names", Opened = true })
+
+TextSection:Toggle({
+    Title    = "Show Names",
+    Desc     = "Display the player name above their box",
+    Flag     = "ESPNames",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.ESPNames = v end,
+})
+
+TextSection:Dropdown({
+    Title    = "Name Style",
+    Desc     = "Which name format to display",
+    Flag     = "ESPNameStyle",
+    Values   = { "Display Name", "Username", "Both" },
+    Value    = "Display Name",
+    Callback = function(v) Settings.Visuals.ESPNameStyle = v end,
+})
+
+TextSection:Slider({
+    Title    = "Text Scale",
+    Desc     = "Size of all ESP text",
+    Flag     = "ESPTextScale",
+    Step     = 1,
+    Value    = { Min = 10, Max = 22, Default = 14 },
+    Callback = function(v) Settings.Visuals.ESPTextScale = v end,
+})
+
+TextSection:Toggle({
+    Title    = "Custom Name Color",
+    Desc     = "Use a fixed color for names instead of the box color",
+    Flag     = "ESPCustomNameColor",
+    Value    = false,
+    Callback = function(v)
+        Settings.Visuals.UseCustomNameColor = v
+        for _, esp in pairs(ESPObjects) do esp._lastNameCol = nil end
+    end,
+})
+
+TextSection:Colorpicker({
+    Title    = "Display Name Color",
+    Desc     = "Color for the display name label (requires Custom Name Color on)",
+    Flag     = "ESPNameColor",
+    Default  = Color3RGB(255, 255, 255),
+    Callback = function(v)
+        Settings.Visuals.ESPNameColor = v
+        for _, esp in pairs(ESPObjects) do esp._lastNameCol = nil end
+    end,
+})
+
+TextSection:Colorpicker({
+    Title    = "Username Color",
+    Desc     = "Color for the @username label (requires Custom Name Color on)",
+    Flag     = "ESPUsernameColor",
+    Default  = Color3RGB(180, 180, 200),
+    Callback = function(v)
+        Settings.Visuals.ESPUsernameColor = v
+        for _, esp in pairs(ESPObjects) do esp._lastNameCol = nil end
+    end,
+})
+
+local HealthSection = ESPTab:Section({ Title = "Health", Opened = true })
+
+HealthSection:Toggle({
+    Title    = "Health Bar",
+    Desc     = "Draw a color-coded health bar on the left side of the box",
+    Flag     = "ESPHealthBar",
+    Value    = true,
+    Callback = function(v) Settings.Visuals.HealthBar = v end,
+})
+
+HealthSection:Toggle({
+    Title    = "Health Numbers",
+    Desc     = "Display the exact HP value below the box",
+    Flag     = "ESPHealthNumbers",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.HealthBar = v end,
+})
+
+local DistSection = ESPTab:Section({ Title = "Distance", Opened = true })
+
+DistSection:Slider({
+    Title    = "ESP Range",
+    Desc     = "Only render ESP on players closer than this (studs)",
+    Flag     = "ESPRange",
+    Step     = 100,
+    Value    = { Min = 100, Max = 5000, Default = 1000 },
+    Callback = function(v) Settings.Visuals.MaxESPDistance = v end,
+})
+
+DistSection:Toggle({
+    Title    = "Distance Display",
+    Desc     = "Show stud distance below each player box",
+    Flag     = "ESPDistDisplay",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.DistanceDisplay = v end,
+})
+
+local ChamsSection = ESPTab:Section({ Title = "Chams", Opened = false })
+
+ChamsSection:Toggle({
+    Title    = "Enable Chams",
+    Desc     = "Highlight player characters using Roblox Highlight",
+    Flag     = "ChamsEnabled",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.ChamsEnabled = v end,
+})
+
+ChamsSection:Toggle({
+    Title    = "See Through Walls",
+    Desc     = "Show chams even when player is behind geometry",
+    Flag     = "ChamsDepth",
+    Value    = true,
+    Callback = function(v)
+        Settings.Visuals.ChamsDepth = v
+        for _, esp in pairs(ESPObjects) do
+            if esp and esp.Highlight then
+                esp.Highlight.DepthMode = v
+                    and Enum.HighlightDepthMode.AlwaysOnTop
+                    or  Enum.HighlightDepthMode.Occluded
+            end
+        end
+    end,
+})
+
+ChamsSection:Colorpicker({
+    Title    = "Fill Color",
+    Desc     = "Interior color of the Highlight",
+    Flag     = "ChamsFill",
+    Default  = Color3RGB(255, 30, 30),
+    Callback = function(v) Settings.Visuals.ChamsFillColor = v end,
+})
+
+ChamsSection:Colorpicker({
+    Title    = "Outline Color",
+    Desc     = "Outline color of the Highlight",
+    Flag     = "ChamsOutline",
+    Default  = Color3RGB(255, 255, 255),
+    Callback = function(v) Settings.Visuals.ChamsOutlineColor = v end,
+})
+
+local LinesSection = ESPTab:Section({ Title = "Lines", Opened = false })
+
+LinesSection:Toggle({
+    Title    = "Tracer Lines",
+    Desc     = "Draw a line from screen edge to each enemy",
+    Flag     = "TracerLines",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.TracerLines = v end,
+})
+
+LinesSection:Dropdown({
+    Title    = "Tracer Origin",
+    Desc     = "Where on-screen the tracer line starts",
+    Flag     = "TracerOrigin",
+    Values   = { "Bottom", "Center", "Top" },
+    Value    = "Bottom",
+    Callback = function(v) Settings.Visuals.TracerOrigin = v end,
+})
+
+LinesSection:Colorpicker({
+    Title    = "Tracer Color",
+    Flag     = "TracerColor",
+    Default  = Color3RGB(0, 200, 255),
+    Callback = function(v) Settings.Visuals.TracerColor = v end,
+})
+
+LinesSection:Toggle({
+    Title    = "Snap Lines",
+    Desc     = "Draw a line from screen center to each enemy",
+    Flag     = "SnapLines",
+    Value    = false,
+    Callback = function(v) Settings.Visuals.SnapLines = v end,
+})
+
+LinesSection:Colorpicker({
+    Title    = "Snap Line Color",
+    Flag     = "SnapLineColor",
+    Default  = Color3RGB(255, 0, 220),
+    Callback = function(v) Settings.Visuals.SnapLineColor = v end,
+})
+
+-- ============================================================
+--   PLAYER TAB
+-- ============================================================
+local SpeedSection = PlayerTab:Section({ Title = "Walk Speed", Opened = true })
+
+SpeedSection:Toggle({
+    Title    = "Enable Walk Speed",
+    Flag     = "WalkSpeedEnabled",
+    Value    = false,
+    Callback = function(v) Settings.Player.WalkSpeedEnabled = v end,
+})
+
+SpeedSection:Slider
